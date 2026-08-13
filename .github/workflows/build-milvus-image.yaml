@@ -1,0 +1,195 @@
+# Build Milvus binary & Milvus runtime image (arm64 / ubuntu20.04) — manual trigger
+#
+# Mirrors the official Milvus release pipeline (ci/jenkins/PublishImages.groovy):
+#   1. Compile the Milvus binary inside the official builder image
+#      milvusdb/milvus-env:ubuntu20.04-<DATE_VERSION> via build/builder.sh
+#      "make install". All official build parameters are preserved, including
+#      the jemalloc setting DMILVUS_JEMALLOC_LG_PAGE in scripts/core_build.sh.
+#      Your modified jemalloc parameters live in this branch's source, so they
+#      are picked up automatically.
+#   2. Assemble the runtime image with build/build_image.sh, which uses
+#      build/docker/milvus/ubuntu20.04/Dockerfile. The official runtime
+#      parameters (LD_PRELOAD=...:/milvus/lib/libjemalloc.so,
+#      MALLOC_CONF=background_thread:true) are taken from that Dockerfile —
+#      including your branch's modifications.
+#   3. Package the built image as <tag>.tar.gz and upload it as a workflow
+#      artifact for download.
+#
+# Scope (per requirement):
+#   - Milvus container OS is fixed to ubuntu20.04 (official recommendation).
+#   - Target architecture is arm64 only.
+#
+# Two-layer architecture note (important):
+#   - GitHub runner (the VM that runs this workflow): ubuntu-24.04-arm, a native
+#     ARM64 hosted runner. GitHub provides ARM64 runners (ubuntu-24.04-arm /
+#     ubuntu-22.04-arm), free & unlimited for public repos, available for
+#     private repos too. No QEMU emulation is needed.
+#   - Milvus builder/runtime container OS: ubuntu20.04 (the milvus-env image and
+#     the runtime Dockerfile). This is independent of the runner image; it runs
+#     inside Docker on the ARM64 runner.
+#
+# Trigger: GitHub -> Actions -> "Build Milvus & Milvus Image" -> Run workflow.
+name: Build Milvus & Milvus Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      milvus_ref:
+        description: 'Milvus branch / tag / ref to build (based on v2.5.19)'
+        required: true
+        default: 'Branch_v2.5.19'
+        type: string
+      image_repo:
+        description: 'Local image repo name (used for tagging & the tar.gz). Push target if push_image=true.'
+        required: true
+        default: 'milvusdb/milvus'
+        type: string
+      image_tag:
+        description: 'Image tag. Leave empty for auto: <ref>-<date>-<sha>'
+        required: false
+        default: ''
+        type: string
+      push_image:
+        description: 'Also push the image to GHCR (otherwise only tar.gz artifact is produced)'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write   # only used when push_image=true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.milvus_ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Milvus (arm64 / ubuntu20.04)
+    # Native ARM64 hosted runner. If your plan does not include ubuntu-24.04-arm,
+    # replace with a self-hosted arm64 runner label, e.g. [self-hosted, ARM64].
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      # Fixed per requirement: ubuntu20.04, arm64 only.
+      OS_NAME: ubuntu20.04
+      IMAGE_ARCH: arm64
+      MILVUS_IMAGE_REPO: ${{ github.event.inputs.image_repo }}
+      DOCKER_BUILDKIT: 1
+      # Host directory mounted into the builder container for ccache / go module
+      # caches (matches build/builder.sh defaults, on an absolute path so it can
+      # be cached by actions/cache).
+      DOCKER_VOLUME_DIRECTORY: ${{ github.workspace }}/.docker
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 10240
+          overprovision-lvm: 'true'
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Checkout ${{ github.event.inputs.milvus_ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.milvus_ref }}
+          fetch-depth: 0
+
+      # build/builder.sh sources .env, which hardcodes OS_NAME / IMAGE_ARCH.
+      # Force them to ubuntu20.04 / arm64 so the builder image tag and the
+      # runtime Dockerfile path are correct. DATE_VERSION (the builder image
+      # version) is kept from the branch's .env.
+      - name: Configure .env (ubuntu20.04 / arm64)
+        run: |
+          sed -i "s/^OS_NAME=.*/OS_NAME=ubuntu20.04/" .env
+          sed -i "s/^IMAGE_ARCH=.*/IMAGE_ARCH=arm64/" .env
+          echo "---- .env ----"
+          cat .env
+
+      - name: Cache builder caches (ccache / go modules)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.docker/arm64-ubuntu20.04-ccache
+            ${{ github.workspace }}/.docker/arm64-ubuntu20.04-go-mod
+          key: milvus-ubuntu20.04-arm64-${{ github.sha }}
+          restore-keys: |
+            milvus-ubuntu20.04-arm64-
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          REF="${{ github.event.inputs.milvus_ref }}"
+          DATE=$(date +%Y%m%d)
+          SHA=$(git rev-parse --short=7 HEAD)
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            TAG="${{ github.event.inputs.image_tag }}"
+          else
+            TAG="${REF}-${DATE}-${SHA}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Generated image tag: ${TAG}"
+
+      # Step 1 — build the binary inside the official builder image.
+      # IS_NETWORK_MODE_HOST=true matches the official release build and lets the
+      # container reach Go proxy / conan. The dirty-tag sed is applied exactly as
+      # in PublishImages.groovy.
+      - name: Build Milvus binary (official builder image)
+        run: |
+          sed -i 's/--dirty="-dev"//g' Makefile || true
+          export IS_NETWORK_MODE_HOST="true"
+          build/builder.sh /bin/bash -c "make install"
+
+      # Step 2 — assemble the runtime image using the official Dockerfile.
+      - name: Build Milvus runtime image
+        id: image
+        run: |
+          export MILVUS_IMAGE_TAG="${{ steps.tag.outputs.tag }}-arm64"
+          export BUILD_ARGS="--build-arg TARGETARCH=arm64"
+          build/build_image.sh
+          echo "ref=${MILVUS_IMAGE_REPO}:${{ steps.tag.outputs.tag }}-arm64" >> "$GITHUB_OUTPUT"
+
+      # Step 3 — package the built image as tar.gz and upload as an artifact.
+      - name: Save image as tar.gz
+        id: save
+        run: |
+          IMAGE_REF="${{ steps.image.outputs.ref }}"
+          FILENAME="milvus-image-${{ steps.tag.outputs.tag }}-arm64.tar.gz"
+          echo "Saving ${IMAGE_REF} -> ${FILENAME}"
+          docker save "${IMAGE_REF}" | gzip -9 > "${FILENAME}"
+          ls -lh "${FILENAME}"
+          echo "filename=${FILENAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: milvus-image-arm64-${{ github.run_id }}
+          path: ${{ steps.save.outputs.filename }}
+          retention-days: 14
+          compression-level: 0   # already gzipped; no extra compression needed
+
+      # Optional — also push to GHCR when push_image is enabled.
+      - name: Login to GHCR
+        if: ${{ github.event.inputs.push_image == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        if: ${{ github.event.inputs.push_image == 'true' }}
+        run: |
+          ARCH_TAG="${{ steps.tag.outputs.tag }}-arm64"
+          docker push "${MILVUS_IMAGE_REPO}:${ARCH_TAG}"
+
+      - name: Show image digest
+        if: ${{ always() }}
+        run: |
+          docker inspect "${MILVUS_IMAGE_REPO}:${{ steps.tag.outputs.tag }}-arm64" \
+            -f '{{.Id}} {{range .RepoDigests}}{{.}} {{end}}' || true
