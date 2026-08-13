@@ -1,30 +1,47 @@
-# Build Milvus binary & Milvus runtime image (arm64 / ubuntu20.04) — manual trigger
+# Build Milvus binary & Milvus runtime image (arm64 / ubuntu22.04) — manual trigger
 #
 # Mirrors the official Milvus release pipeline (ci/jenkins/PublishImages.groovy):
-#   1. Compile the Milvus binary inside the official builder image
-#      milvusdb/milvus-env:ubuntu20.04-<DATE_VERSION> via build/builder.sh
-#      "make install". All official build parameters are preserved, including
-#      the jemalloc setting DMILVUS_JEMALLOC_LG_PAGE in scripts/core_build.sh.
-#      Your modified jemalloc parameters live in this branch's source, so they
-#      are picked up automatically.
+#   1. Compile the Milvus binary INSIDE the official builder image
+#      milvusdb/milvus-env:ubuntu22.04-<DATE_VERSION> via build/builder.sh
+#      "make install". The standard official toolchain lives in this image, and
+#      all official build parameters are preserved, including the jemalloc
+#      setting DMILVUS_JEMALLOC_LG_PAGE in scripts/core_build.sh. Your modified
+#      jemalloc parameters live in this branch's source, so they are picked up
+#      automatically.
 #   2. Assemble the runtime image with build/build_image.sh, which uses
-#      build/docker/milvus/ubuntu20.04/Dockerfile. The official runtime
+#      build/docker/milvus/ubuntu22.04/Dockerfile. The official runtime
 #      parameters (LD_PRELOAD=...:/milvus/lib/libjemalloc.so,
 #      MALLOC_CONF=background_thread:true) are taken from that Dockerfile —
 #      including your branch's modifications.
 #   3. Package the built image as <tag>.tar.gz and upload it as a workflow
-#      artifact for download.
+#      artifact for download. No registry push occurs (GHCR/Docker Hub disabled).
 #
 # Scope (per requirement):
-#   - Milvus container OS is fixed to ubuntu20.04 (official recommendation).
 #   - Target architecture is arm64 only.
+#   - Milvus container OS is ubuntu22.04.
+#
+# Why ubuntu22.04 and not ubuntu20.04:
+#   The official milvus-env builder images are published for ubuntu22.04 /
+#   ubuntu24.04 only. There is NO ubuntu20.04 milvus-env tag, and therefore no
+#   arm64 builder for ubuntu20.04. Building on an arm64 runner requires the
+#   ubuntu22.04 (or 24.04) arm64 builder image, which DOES exist and ships the
+#   standard toolchain. Branch_v2.5.19 itself defaults to OS_NAME=ubuntu22.04.
+#
+# Arm64 pitfall (why DOCKER_DEFAULT_PLATFORM=linux/arm64 is required):
+#   The branch-pinned milvus-env (DATE_VERSION from .env) has an *inactive*
+#   arm64 manifest on Docker Hub. Without forcing the platform, `docker compose
+#   pull` silently falls back to the amd64 builder, which then runs under QEMU;
+#   that x86_64 GCC has no `arm_sve.h`, so knowhere fails with
+#   "arm_sve.h: No such file or directory". Forcing linux/arm64 (plus the
+#   self-healing fallback to the active 20260714-c135601 arm64 image) guarantees
+#   a native arm64 toolchain where arm_sve.h is present.
 #
 # Two-layer architecture note (important):
 #   - GitHub runner (the VM that runs this workflow): ubuntu-24.04-arm, a native
 #     ARM64 hosted runner. GitHub provides ARM64 runners (ubuntu-24.04-arm /
-#     ubuntu-22.04-arm), free & unlimited for public repos, available for
-#     private repos too. No QEMU emulation is needed.
-#   - Milvus builder/runtime container OS: ubuntu20.04 (the milvus-env image and
+#     ubuntu-22.04-arm), free & unlimited for public repos. No QEMU emulation is
+#     needed.
+#   - Milvus builder/runtime container OS: ubuntu22.04 (the milvus-env image and
 #     the runtime Dockerfile). This is independent of the runner image; it runs
 #     inside Docker on the ARM64 runner.
 #
@@ -40,7 +57,7 @@ on:
         default: 'Branch_v2.5.19'
         type: string
       image_repo:
-        description: 'Local image repo name (used for tagging & the tar.gz). Push target if push_image=true.'
+        description: 'Local image repo name used to tag the built image (also drives the tar.gz filename). No registry push occurs.'
         required: true
         default: 'milvusdb/milvus'
         type: string
@@ -49,15 +66,15 @@ on:
         required: false
         default: ''
         type: string
-      push_image:
-        description: 'Also push the image to GHCR (otherwise only tar.gz artifact is produced)'
-        required: true
-        default: false
-        type: boolean
+      builder_date_version:
+        description: 'Optional override for the milvus-env builder DATE_VERSION (arm64). Leave empty to use the branch-pinned version. Use 20260714-c135601 only if the pinned one has no arm64 manifest.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
-  packages: write   # only used when push_image=true
+  actions: write   # required by actions/upload-artifact@v4 (no registry push happens)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.inputs.milvus_ref }}
@@ -65,17 +82,24 @@ concurrency:
 
 jobs:
   build:
-    name: Build Milvus (arm64 / ubuntu20.04)
+    name: Build Milvus (arm64 / ubuntu22.04)
     # Native ARM64 hosted runner. If your plan does not include ubuntu-24.04-arm,
     # replace with a self-hosted arm64 runner label, e.g. [self-hosted, ARM64].
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     env:
-      # Fixed per requirement: ubuntu20.04, arm64 only.
-      OS_NAME: ubuntu20.04
+      # Fixed per requirement: ubuntu22.04 (the only ubuntu with an arm64
+      # milvus-env builder), arm64 only.
+      OS_NAME: ubuntu22.04
       IMAGE_ARCH: arm64
       MILVUS_IMAGE_REPO: ${{ github.event.inputs.image_repo }}
       DOCKER_BUILDKIT: 1
+      # CRITICAL for arm64: force the arm64 image and forbid any amd64 fallback.
+      # The branch-pinned milvus-env (DATE_VERSION from .env) has an *inactive*
+      # arm64 manifest on Docker Hub; without this, `docker compose pull` silently
+      # falls back to the amd64 builder (run via QEMU), whose x86_64 GCC has no
+      # `arm_sve.h` -> knowhere fails with "arm_sve.h: No such file or directory".
+      DOCKER_DEFAULT_PLATFORM: linux/arm64
       # Host directory mounted into the builder container for ccache / go module
       # caches (matches build/builder.sh defaults, on an absolute path so it can
       # be cached by actions/cache).
@@ -100,14 +124,19 @@ jobs:
           ref: ${{ github.event.inputs.milvus_ref }}
           fetch-depth: 0
 
-      # build/builder.sh sources .env, which hardcodes OS_NAME / IMAGE_ARCH.
-      # Force them to ubuntu20.04 / arm64 so the builder image tag and the
-      # runtime Dockerfile path are correct. DATE_VERSION (the builder image
-      # version) is kept from the branch's .env.
-      - name: Configure .env (ubuntu20.04 / arm64)
+      # build/builder.sh sources .env, which hardcodes OS_NAME / IMAGE_ARCH /
+      # DATE_VERSION. Force OS_NAME=ubuntu22.04 and IMAGE_ARCH=arm64 so the
+      # builder image tag and the runtime Dockerfile path are correct. Keep the
+      # branch's DATE_VERSION (the builder image version) unless an override is
+      # supplied.
+      - name: Configure .env (ubuntu22.04 / arm64)
         run: |
-          sed -i "s/^OS_NAME=.*/OS_NAME=ubuntu20.04/" .env
+          sed -i "s/^OS_NAME=.*/OS_NAME=ubuntu22.04/" .env
           sed -i "s/^IMAGE_ARCH=.*/IMAGE_ARCH=arm64/" .env
+          if [ -n "${{ github.event.inputs.builder_date_version }}" ]; then
+            sed -i "s/^DATE_VERSION=.*/DATE_VERSION=${{ github.event.inputs.builder_date_version }}/" .env
+            sed -i "s/^LATEST_DATE_VERSION=.*/LATEST_DATE_VERSION=${{ github.event.inputs.builder_date_version }}/" .env
+          fi
           echo "---- .env ----"
           cat .env
 
@@ -115,11 +144,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ${{ github.workspace }}/.docker/arm64-ubuntu20.04-ccache
-            ${{ github.workspace }}/.docker/arm64-ubuntu20.04-go-mod
-          key: milvus-ubuntu20.04-arm64-${{ github.sha }}
+            ${{ github.workspace }}/.docker/arm64-ubuntu22.04-ccache
+            ${{ github.workspace }}/.docker/arm64-ubuntu22.04-go-mod
+          key: milvus-ubuntu22.04-arm64-${{ github.sha }}
           restore-keys: |
-            milvus-ubuntu20.04-arm64-
+            milvus-ubuntu22.04-arm64-
 
       - name: Compute image tag
         id: tag
@@ -130,15 +159,35 @@ jobs:
           if [ -n "${{ github.event.inputs.image_tag }}" ]; then
             TAG="${{ github.event.inputs.image_tag }}"
           else
-            TAG="${REF}-${DATE}-${SHA}"
+            # Sanitize any '/' in the ref so the tag / tar.gz filename stays path-safe.
+            TAG="${REF//\//-}-${DATE}-${SHA}"
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Generated image tag: ${TAG}"
 
-      # Step 1 — build the binary inside the official builder image.
+      # Step 1 — pull the official builder image, then build the binary inside it.
+      # The build ALREADY runs inside milvus-env (via build/builder.sh ->
+      # `docker compose run builder`), which carries the standard toolchain.
       # IS_NETWORK_MODE_HOST=true matches the official release build and lets the
-      # container reach Go proxy / conan. The dirty-tag sed is applied exactly as
-      # in PublishImages.groovy.
+      # container reach Go proxy / conan. The dirty-tag sed mirrors
+      # PublishImages.groovy.
+      #
+      # Self-healing: try the branch-pinned builder image first; if its arm64
+      # manifest is unavailable, fall back to a known-good active arm64 builder
+      # so the workflow still succeeds.
+      - name: Pull builder image (official milvus-env)
+        run: |
+          if ! build/builder.sh pull; then
+            echo "::warning::Branch-pinned milvus-env arm64 image unavailable; falling back to 20260714-c135601"
+            sed -i "s/^DATE_VERSION=.*/DATE_VERSION=20260714-c135601/" .env
+            sed -i "s/^LATEST_DATE_VERSION=.*/LATEST_DATE_VERSION=20260714-c135601/" .env
+            build/builder.sh pull
+          fi
+
+      - name: Verify arm64 native toolchain (diagnostic)
+        run: |
+          build/builder.sh /bin/bash -c "echo ARCH=\$(uname -m); gcc -dumpmachine; if ls /usr/lib/gcc/*/*/include/arm_sve.h >/dev/null 2>&1; then echo 'arm_sve.h OK'; else echo 'arm_sve.h MISSING'; fi"
+
       - name: Build Milvus binary (official builder image)
         run: |
           sed -i 's/--dirty="-dev"//g' Makefile || true
@@ -173,23 +222,9 @@ jobs:
           retention-days: 14
           compression-level: 0   # already gzipped; no extra compression needed
 
-      # Optional — also push to GHCR when push_image is enabled.
-      - name: Login to GHCR
-        if: ${{ github.event.inputs.push_image == 'true' }}
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Push image to GHCR
-        if: ${{ github.event.inputs.push_image == 'true' }}
-        run: |
-          ARCH_TAG="${{ steps.tag.outputs.tag }}-arm64"
-          docker push "${MILVUS_IMAGE_REPO}:${ARCH_TAG}"
-
-      - name: Show image digest
+      - name: Show built image info
         if: ${{ always() }}
         run: |
-          docker inspect "${MILVUS_IMAGE_REPO}:${{ steps.tag.outputs.tag }}-arm64" \
-            -f '{{.Id}} {{range .RepoDigests}}{{.}} {{end}}' || true
+          docker image inspect "${MILVUS_IMAGE_REPO}:${{ steps.tag.outputs.tag }}-arm64" \
+            --format 'id={{.Id}} arch={{.Architecture}} os={{.Os}}' || true
+          docker images "${MILVUS_IMAGE_REPO}:${{ steps.tag.outputs.tag }}-arm64" || true
